@@ -1,0 +1,489 @@
+= Отчёт по лекции 2
+:author: Апанович Семен
+:sectnums:
+:source-highlighter: highlight.js
+
+== Цель работы
+
+На лекции мы взяли код из прошлого занятия (управление светодиодами на микроконтроллере) и переделали его под новые задачи:
+
+. Зажигать светодиоды в шахматном порядке.
+. Чередовать два режима по таймеру: 5 секунд «ёлочка», 5 секунд «шахматы».
+. Привести код в порядок: разделить его на классы и интерфейсы.
+. Сделать для светодиода (LED) такую же структуру классов, как уже сделана для вывода (Pin).
+
+== Исходный код: режим «ёлочка»
+
+Старая программа по очереди включает четыре светодиода, а затем по очереди выключает их. Паузы между действиями сделаны функцией `delay()` — это пустой цикл, который просто тратит время.
+
+Используются выводы: `GPIOC5`, `GPIOC8`, `GPIOC9` и `GPIOA5`.
+
+[source,cpp]
+----
+#include "rccregisters.hpp"
+#include "gpioaregisters.hpp"
+#include "gpiocregisters.hpp"
+
+std::uint32_t SystemCoreClock = 16'000'000U;
+
+extern "C" {
+int __low_level_init(void)
+{
+    RCC::CR::HSION::On::Set();
+    while (RCC::CR::HSIRDY::NotReady::IsSet())
+    {
+    }
+
+    RCC::CFGR::SW::Hsi::Set();
+    while (!RCC::CFGR::SWS::Hsi::IsSet())
+    {
+    }
+
+    RCC::APB2ENR::SYSCFGEN::Enable::Set();
+
+    return 1;
+}
+}
+
+void delay(int cycles)
+{
+    for (int i = 0; i < cycles; ++i)
+    {
+        asm volatile("");
+    }
+}
+
+int main()
+{
+    RCC::AHB1ENR::GPIOAEN::Enable::Set();
+    RCC::AHB1ENR::GPIOCEN::Enable::Set();
+
+    GPIOA::MODER::MODER5::Output::Set();
+    GPIOC::MODER::MODER5::Output::Set();
+    GPIOC::MODER::MODER8::Output::Set();
+    GPIOC::MODER::MODER9::Output::Set();
+
+    for (;;)
+    {
+        GPIOC::ODR::ODR5::High::Set();
+        delay(1000000);
+
+        GPIOC::ODR::ODR8::High::Set();
+        delay(1000000);
+
+        GPIOC::ODR::ODR9::High::Set();
+        delay(1000000);
+
+        GPIOA::ODR::ODR5::High::Set();
+        delay(1000000);
+
+        GPIOC::ODR::ODR5::Low::Set();
+        delay(1000000);
+
+        GPIOC::ODR::ODR8::Low::Set();
+        delay(1000000);
+
+        GPIOC::ODR::ODR9::Low::Set();
+        delay(1000000);
+
+        GPIOA::ODR::ODR5::Low::Set();
+        delay(1000000);
+    }
+
+    return 1;
+}
+----
+
+Как работает код:
+
+* `+__low_level_init+` настраивает тактирование: включает внутренний генератор HSI (16 МГц) и выбирает его как источник тактового сигнала.
+* В `main` включается тактирование портов GPIOA и GPIOC, а нужные выводы переводятся в режим выхода (`Output`).
+* В бесконечном цикле светодиоды сначала включаются один за другим (`High`), потом выключаются в том же порядке (`Low`).
+
+== Режим «шахматы»
+
+Новый режим должен был зажигать светодиоды в шахматном порядке. У нас получилось сделать это так: сначала загораются второй и четвёртый светодиоды, потом они гаснут, загораются первый и третий, потом они тоже гаснут, и всё повторяется. То есть одновременно горят два светодиода.
+
+== Переключение режимов по таймеру
+
+Преподаватель сказал, что теперь можно сделать задачу сложнее: 5 секунд работает режим «ёлочка», затем 5 секунд режим «шахматы», и так по кругу. Для этого мы подключили системный таймер SysTick.
+
+=== Идея
+
+* SysTick настраивается так, чтобы срабатывать раз в 1 миллисекунду: `16000000 / 1000 - 1` тактов.
+* Функция `GetMs()` проверяет флаг `COUNTFLAG`. Если таймер досчитал до нуля, счётчик миллисекунд `current_ms` увеличивается на 1.
+* В главном цикле мы сравниваем текущее время с моментом последней смены режима. Если прошло 5000 мс, режим меняется, а все светодиоды выключаются функцией `ResetAllLEDs()`.
+* Внутри каждого режима номер шага вычисляется из времени: для «ёлочки» `(время / 400) % 8`, для «шахмат» `(время / 500) % 4`. Так `delay()` больше не нужен, и программа не «замирает» на паузах.
+
+=== Код
+
+[source,cpp]
+----
+#include "rccregisters.hpp" // for RCC
+#include "gpioaregisters.hpp" // for GPIOA
+#include "gpiocregisters.hpp" // for GPIOC
+#include <cstdint>
+
+std::uint32_t SystemCoreClock = 16000000U;
+
+// Адреса регистров SysTick
+static volatile uint32_t *const SYSTICK_CTRL = (uint32_t *)0xE000E010;
+static volatile uint32_t *const SYSTICK_LOAD = (uint32_t *)0xE000E014;
+static volatile uint32_t *const SYSTICK_VAL  = (uint32_t *)0xE000E018;
+
+// Переменная для подсчёта миллисекунд
+static uint32_t current_ms = 0;
+
+// Возвращает текущее время в миллисекундах
+uint32_t GetMs(void)
+{
+  // Проверяем флаг COUNTFLAG (16-й бит): он ставится, когда таймер досчитал до нуля
+  if (*SYSTICK_CTRL & (1U << 16))
+  {
+    current_ms++;
+  }
+  return current_ms;
+}
+
+extern "C" int __low_level_init(void)
+{
+  // Настройка HSI 16 МГц
+  RCC::CR::HSION::On::Set();
+  while (RCC::CR::HSIRDY::NotReady::IsSet()) {}
+
+  RCC::CFGR::SW::Hsi::Set();
+  while (!RCC::CFGR::SWS::Hsi::IsSet()) {}
+
+  RCC::APB2ENR::SYSCFGEN::Enable::Set();
+
+  // Настройка SysTick на 1 миллисекунду (16000 тактов)
+  *SYSTICK_LOAD = (16000000U / 1000U) - 1U;
+  *SYSTICK_VAL  = 0U;
+  *SYSTICK_CTRL = 0x05U; // Включаем счётчик + тактирование от процессора (без прерываний)
+
+  return 1;
+}
+
+void ResetAllLEDs()
+{
+  GPIOA::ODR::ODR5::Low::Set();
+  GPIOC::ODR::ODR5::Low::Set();
+  GPIOC::ODR::ODR8::Low::Set();
+  GPIOC::ODR::ODR9::Low::Set();
+}
+
+int main(void)
+{
+  RCC::AHB1ENR::GPIOAEN::Enable::Set();
+  RCC::AHB1ENR::GPIOCEN::Enable::Set();
+
+  GPIOA::MODER::MODER5::Output::Set();
+  GPIOC::MODER::MODER5::Output::Set();
+  GPIOC::MODER::MODER8::Output::Set();
+  GPIOC::MODER::MODER9::Output::Set();
+
+  uint32_t lastModeChange = 0;
+  uint8_t currentMode = 1;
+  uint32_t internalStep = 0;
+
+  while (1)
+  {
+    // GetMs() нужно вызывать в каждой итерации цикла!
+    uint32_t currentTicks = GetMs();
+
+    // Каждые 5 секунд (5000 мс) переключаем режим
+    if (currentTicks - lastModeChange >= 5000)
+    {
+      lastModeChange = currentTicks;
+      currentMode = (currentMode == 1) ? 2 : 1;
+      ResetAllLEDs();
+    }
+
+    if (currentMode == 1)
+    {
+      // Режим 1: «ёлочка» (шаг каждые 400 мс)
+      internalStep = (currentTicks / 400) % 8;
+
+      switch (internalStep)
+      {
+        case 0: GPIOC::ODR::ODR5::High::Set(); break;
+        case 1: GPIOC::ODR::ODR8::High::Set(); break;
+        case 2: GPIOC::ODR::ODR9::High::Set(); break;
+        case 3: GPIOA::ODR::ODR5::High::Set(); break;
+
+        case 4: GPIOC::ODR::ODR5::Low::Set(); break;
+        case 5: GPIOC::ODR::ODR8::Low::Set(); break;
+        case 6: GPIOC::ODR::ODR9::Low::Set(); break;
+        case 7: GPIOA::ODR::ODR5::Low::Set(); break;
+      }
+    }
+    else // currentMode == 2
+    {
+      // Режим 2: «шахматы» (шаг каждые 500 мс)
+      internalStep = (currentTicks / 500) % 4;
+
+      switch (internalStep)
+      {
+        case 0:
+          GPIOA::ODR::ODR5::High::Set();
+          GPIOC::ODR::ODR8::High::Set();
+          GPIOC::ODR::ODR5::Low::Set();
+          GPIOC::ODR::ODR9::Low::Set();
+          break;
+        case 1:
+          GPIOA::ODR::ODR5::Low::Set();
+          GPIOC::ODR::ODR8::Low::Set();
+          break;
+        case 2:
+          GPIOC::ODR::ODR5::High::Set();
+          GPIOC::ODR::ODR9::High::Set();
+          break;
+        case 3:
+          GPIOC::ODR::ODR5::Low::Set();
+          GPIOC::ODR::ODR9::Low::Set();
+          break;
+      }
+    }
+  }
+}
+----
+
+== Улучшение кода: классы и интерфейсы
+
+Преподаватель сказал, что код получился «кривоватым»: всё лежит в одном файле, а к выводам микроконтроллера мы обращаемся длинными записями вроде `GPIOC::ODR::ODR5::High::Set()`. Поэтому мы стали переписывать программу в объектном стиле. Для начала сделали класс для одного вывода (Pin).
+
+Созданные файлы:
+
+* `IPin.h` — интерфейс вывода;
+* `Pin.h` — шаблонный класс, который реализует этот интерфейс;
+* `main.cpp` — главный файл, который использует `Pin`.
+
+=== Интерфейс IPin
+
+Интерфейс описывает, что умеет делать любой вывод. Все методы чисто виртуальные (`= 0`), то есть реализацию должен написать класс-наследник.
+
+[source,cpp]
+----
+#ifndef UNTITLED2_IPIN_H
+#define UNTITLED2_IPIN_H
+
+class IPin
+{
+public:
+  virtual ~IPin() = default;
+
+  virtual void Set() = 0;           // включить (высокий уровень)
+  virtual void Reset() = 0;         // выключить (низкий уровень)
+  virtual void Toggle() = 0;        // переключить в противоположное состояние
+  virtual bool GetState() const = 0; // узнать текущее состояние
+};
+
+#endif
+----
+
+=== Класс Pin
+
+`Pin` — шаблонный класс. В шаблон передаются два параметра: порт (`TPort`, например `GPIOC::ODR`) и номер вывода (`pinNum`). Благодаря этому один класс подходит для любого вывода любого порта.
+
+[source,cpp]
+----
+#ifndef UNTITLED2_PIN_H
+#define UNTITLED2_PIN_H
+
+#include <cassert>
+
+#include "IPin.h"
+#include "gpiocregisters.hpp" // for GPIOC
+
+template <typename TPort, int pinNum>
+class Pin final : public IPin
+{
+public:
+  void Set() override
+  {
+    TPort::Set(uint8_t(1U) << pinNum);
+  }
+
+  void Reset() override
+  {
+//    TPort::Reset(uint8_t(1U) << pinNum);
+  }
+
+  void Toggle() override
+  {
+    TPort::Toggle(uint8_t(1U) << pinNum);
+  }
+
+  bool GetState() const override
+  {
+    // POTOM KRCH
+    assert(true);
+  }
+};
+
+#endif // UNTITLED2_PIN_H
+----
+
+=== Использование Pin в main
+
+Теперь вместо длинных записей мы создаём объекты-выводы и вызываем у них понятные методы:
+
+[source,cpp]
+----
+Pin<GPIOC::ODR,5> Pin5;
+Pin<GPIOC::ODR,8> Pin8;
+Pin<GPIOC::ODR,9> Pin9;
+Pin<GPIOA::ODR,5> Pin5a;
+
+int main(void)
+{
+  RCC::AHB1ENR::GPIOAEN::Enable::Set();
+  RCC::AHB1ENR::GPIOCEN::Enable::Set();
+
+  GPIOA::MODER::MODER5::Output::Set();
+  GPIOC::MODER::MODER5::Output::Set();
+  GPIOC::MODER::MODER8::Output::Set();
+  GPIOC::MODER::MODER9::Output::Set();
+
+  while (1)
+  {
+    Pin5.Toggle();
+    delay(1000000);
+    Pin8.Toggle();
+    delay(1000000);
+    Pin9.Toggle();
+    delay(1000000);
+    Pin5a.Toggle();
+    delay(1000000);
+  }
+}
+----
+
+Здесь используется метод `Toggle()`: он меняет состояние светодиода на противоположное. Поэтому при каждом проходе по циклу светодиод то включается, то выключается.
+
+=== Замечания к коду (что ещё нужно доработать)
+
+* В `IPin.h` защита от повторного включения была написана с опечаткой (`INTITLED2_IPIN_H` вместо `UNTITLED2_IPIN_H`), в отчёте она исправлена.
+* Метод `Reset()` в `Pin` пока закомментирован — вывод нельзя выключить напрямую, только переключить.
+* Метод `GetState()` — заглушка (`assert(true)`), он ничего не возвращает. Его нужно будет дописать позже.
+
+== Структура классов для светодиода (LED)
+
+Задание: сделать для светодиода такую же структуру, как для Pin, и привести её в отчёте.
+
+=== Общая схема
+
+В проекте четыре пары «интерфейс — класс»: `IPin` / `Pin`, `ILed` / `Led`, `IMode` / `Mode`, `IModeManager` / `ModeManager`. Структура описана UML-диаграммой классов:
+
+* Класс `Pin` наследуется от интерфейса `IPin` (стрелка с пустым треугольником).
+* Класс `Led` наследуется от интерфейса `ILed`.
+* `Mode` (режим работы) наследуется от `IMode`, а `ModeManager` (менеджер режимов) — от `IModeManager`.
+
+=== Связи между классами
+
+Светодиод не работает с регистрами напрямую, а использует вывод через интерфейс `IPin`. Режим (`Mode`) в свою очередь работает с массивом светодиодов `ILed[]`.
+
+На UML-диаграмме связей видно, что:
+
+* `Led` получает в конструкторе вывод: `Led(IPin pin)`;
+* `Button` (кнопка) тоже строится на `IPin`;
+* `Mode` получает набор светодиодов: `Mode(ILed[] leds)`.
+
+`ModeManager` хранит набор режимов `IMode[]` и переключает их. У каждого режима есть методы `Init()` (подготовка) и `Work()` (работа).
+
+=== Интерфейс ILed
+
+Интерфейс светодиода описывает три действия: включить, выключить, переключить. Он сделан по аналогии с `IPin`.
+
+[source,cpp]
+----
+#ifndef UNTITLED2_ILED_H
+#define UNTITLED2_ILED_H
+
+class ILed
+{
+public:
+  virtual ~ILed() = default;
+
+  virtual void Light() = 0;   // включить светодиод
+  virtual void PutOut() = 0;  // выключить светодиод
+  virtual void Toggle() = 0;  // переключить состояние
+};
+
+#endif // UNTITLED2_ILED_H
+----
+
+=== Класс Led
+
+Класс `Led` реализует интерфейс `ILed`. Внутри он хранит ссылку на вывод `IPin` и просто вызывает его методы:
+
+* `Light()` вызывает `pin.Set()`;
+* `PutOut()` вызывает `pin.Reset()`;
+* `Toggle()` вызывает `pin.Toggle()`.
+
+[source,cpp]
+----
+#ifndef UNTITLED2_LED_H
+#define UNTITLED2_LED_H
+
+#include "ILed.h"
+#include "IPin.h"
+
+class Led final : public ILed
+{
+public:
+  explicit Led(IPin& pin)
+    : pin(pin)
+  {
+  }
+
+  void Light() override
+  {
+    pin.Set();
+  }
+
+  void PutOut() override
+  {
+    pin.Reset();
+  }
+
+  void Toggle() override
+  {
+    pin.Toggle();
+  }
+
+private:
+  IPin& pin;
+};
+
+#endif // UNTITLED2_LED_H
+----
+
+Слово `explicit` перед конструктором запрещает неявное создание светодиода из вывода, а `final` говорит, что от `Led` нельзя наследоваться.
+
+=== Пример использования
+
+Теперь светодиод создаётся из вывода, и в программе нигде не нужно писать названия регистров:
+
+[source,cpp]
+----
+Pin<GPIOC::ODR, 5> pin5;
+Led led1(pin5);
+
+led1.Light();   // включили
+delay(1000000);
+led1.PutOut();  // выключили
+----
+
+Важно: `PutOut()` заработает полностью только после того, как в `Pin::Reset()` будет раскомментирован код выключения вывода.
+
+== Вывод
+
+На лекции мы:
+
+* повторили работу со светодиодами и портами GPIO на микроконтроллере;
+* реализовали режим «шахматы» и переключение режимов «ёлочка» / «шахматы» каждые 5 секунд с помощью таймера SysTick;
+* переписали код в объектном стиле: создали интерфейс `IPin` и шаблонный класс `Pin`;
+* по тому же принципу разработали интерфейс `ILed` и класс `Led`, который использует `IPin` и скрывает от программиста работу с регистрами.
+
+Такая структура удобнее: код проще читать, а режимы работы (`Mode`) можно писать, не думая о том, к какому именно выводу подключён светодиод.
