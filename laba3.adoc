@@ -1,0 +1,481 @@
+= Отчёт по лабораторной работе №3
+Апанович Семён, группа КЭ-413
+
+:sectnums:
+:source-highlighter: highlight.js
+
+== Цель работы
+
+Доделать программу для управления светодиодами в объектно-ориентированном стиле. В прошлой работе мы сделали классы для вывода (`Pin`) и светодиода (`Led`). В этой работе нужно:
+
+. Сделать интерфейс режима работы `IMode` и несколько режимов: моргание, «ёлочка» и «шахматка».
+. Положить светодиоды и режимы в массивы `std::array`.
+. Сделать так, чтобы режимы переключались сами каждые примерно 10 секунд.
+. Добавить новый режим (шахматку) так, чтобы логика в `main` не менялась.
+
+== Структура проекта
+
+Проект состоит из нескольких заголовочных файлов и файла `main.cpp`:
+
+[cols="1,3"]
+|===
+| Файл | Для чего нужен
+
+| `IPin.h` | интерфейс вывода микроконтроллера
+| `Pin.h` | класс вывода (шаблон), реализует `IPin`
+| `ILed.h` | интерфейс светодиода
+| `Led.h` | класс светодиода, реализует `ILed`
+| `IMode.h` | интерфейс режима работы
+| `ModeBlink.h` | режим «все светодиоды моргают»
+| `ModeTree.h` | режим «ёлочка» (светодиоды переключаются по очереди)
+| `ModeChess.h` | режим «шахматка»
+| `main.cpp` | главный файл, где всё создаётся и запускается
+|===
+
+Идея такая: `Pin` знает, как управлять ножкой микроконтроллера, `Led` использует `Pin` и умеет включаться и выключаться, а режимы (`Mode`) работают с массивом светодиодов и ничего не знают про ножки.
+
+== Интерфейсы
+
+=== IPin
+
+Интерфейс вывода. Он описывает четыре действия: включить, выключить, переключить и узнать состояние.
+
+[source,cpp]
+----
+#ifndef UNTITLED2_CONTRACTS_IPIN_H
+#define UNTITLED2_CONTRACTS_IPIN_H
+
+class IPin
+{
+  public:
+
+    virtual void Set() = 0;
+    virtual void Reset() = 0;
+    virtual void Toggle() = 0;
+    virtual bool GetState() const = 0;
+};
+
+#endif
+----
+
+=== ILed
+
+Интерфейс светодиода. Светодиод может только гореть, не гореть и переключаться, поэтому методов три, а `GetState()` как у вывода нет.
+
+[source,cpp]
+----
+#ifndef UNTITLED2_ILED_H
+#define UNTITLED2_ILED_H
+
+class ILed
+{
+public:
+    virtual void Light() = 0;
+    virtual void PutOut() = 0;
+    virtual void Toggle() = 0;
+
+    // Виртуальный деструктор обязателен для интерфейсов
+    virtual ~ILed() = default;
+};
+
+#endif
+----
+
+=== IMode
+
+Интерфейс режима работы. У любого режима есть два метода:
+
+* `Init()` — начальная настройка режима (вызывается при переходе на этот режим);
+* `Work()` — один шаг работы режима (вызывается по кругу в главном цикле).
+
+[source,cpp]
+----
+#ifndef UNTITLED2_CONTRACTS_IMODE_H
+#define UNTITLED2_CONTRACTS_IMODE_H
+
+class IMode
+{
+public:
+    virtual ~IMode() = default;
+
+    virtual void Work() = 0;
+    virtual void Init() = 0;
+};
+
+#endif // UNTITLED2_CONTRACTS_IMODE_H
+----
+
+== Классы Pin и Led
+
+=== Pin
+
+`Pin` — шаблонный класс. В шаблон передаются порт (например, `GPIOC::ODR`) и номер ножки. Методы `Set()` и `Toggle()` меняют нужный бит в регистре порта.
+
+[source,cpp]
+----
+#ifndef UNTITLED2_IPIN_H
+#define UNTITLED2_IPIN_H
+#include <cassert>
+
+#include "IPin.h"
+
+template <typename TPort, int pinNum>
+class Pin final : public IPin
+{
+  public:
+    void Set() override
+    {
+      TPort::Set(uint8_t(1U) << pinNum);
+    }
+
+    void Reset() override
+    {
+      //TPort::Reset(uint8_t(1U) << pinNum);
+    }
+
+    void Toggle() override
+    {
+      TPort::Toggle(uint8_t(1U) << pinNum);
+    }
+
+    bool GetState() const override
+    {
+      // Пока не реализуем
+      assert(true);
+    }
+
+};
+
+#endif
+----
+
+Метод `Reset()` пока закомментирован, а `GetState()` не доделан. Для наших режимов это не мешает, потому что они используют только `Light()` и `Toggle()`.
+
+=== Led
+
+`Led` получает в конструкторе ссылку на `IPin` и просто вызывает его методы: `Light()` вызывает `Set()`, `PutOut()` вызывает `Reset()`, `Toggle()` вызывает `Toggle()`.
+
+[source,cpp]
+----
+#ifndef UNTITLED2_LED_H
+#define UNTITLED2_LED_H
+
+#include "ILed.h"
+#include "IPin.h"
+
+class Led final : public ILed
+{
+public:
+    explicit Led(IPin& pin)
+        : pin(pin)
+    {
+    }
+
+    void Light() override
+    {
+        pin.Set();
+    }
+
+    void PutOut() override
+    {
+        pin.Reset();
+    }
+
+    void Toggle() override
+    {
+        pin.Toggle();
+    }
+
+private:
+    IPin& pin;
+};
+
+#endif
+----
+
+== Режимы работы
+
+Все режимы — шаблонные классы, которые наследуют `IMode`. В конструктор они получают массив указателей на светодиоды `std::array<ILed*, Size>`. Размер массива передаётся как параметр шаблона, поэтому режим работает с любым количеством светодиодов.
+
+Использовать `std::array` удобнее, чем обычный массив из языка C: он знает свой размер и не даёт выйти за границы массива.
+
+=== ModeBlink — моргание
+
+* `Init()` — зажигает все светодиоды.
+* `Work()` — переключает все светодиоды. Получается, что все горят, потом все гаснут, и так по кругу.
+
+[source,cpp]
+----
+#ifndef UNTITLED2_MODEBLINK_H
+#define UNTITLED2_MODEBLINK_H
+
+#include "ILed.h"
+#include "IMode.h"
+#include <array>
+#include <cstddef>
+
+template <std::size_t Size>
+class ModeBlink final : public IMode
+{
+public:
+    explicit ModeBlink(const std::array<ILed*, Size>& leds)
+        : leds(leds)
+    {
+    }
+
+    void Init() override
+    {
+        for (ILed* led : leds)
+        {
+            led->Light();
+        }
+    }
+
+    void Work() override
+    {
+        for (auto led : leds)
+        {
+            led->Toggle();
+        }
+    }
+
+private:
+    const std::array<ILed*, Size>& leds;
+};
+
+#endif // UNTITLED2_MODEBLINK_H
+----
+
+=== ModeTree — «ёлочка»
+
+* `Init()` — зажигает все светодиоды и обнуляет счётчик шага `step`.
+* `Work()` — за один вызов переключает один светодиод с номером `step` и увеличивает `step`. Когда `step` дошёл до размера массива, он снова становится равным нулю.
+
+В итоге светодиоды по очереди гаснут, а затем по очереди загораются снова.
+
+[source,cpp]
+----
+#ifndef UNTITLED2_MODETREE_H
+#define UNTITLED2_MODETREE_H
+
+#include <array>
+#include "ILed.h"
+#include "IMode.h"
+
+template <std::size_t Size>
+class ModeTree final : public IMode
+{
+public:
+    explicit ModeTree(const std::array<ILed*, Size>& leds)
+        : leds(leds)
+        , step(0U)
+    {
+    }
+
+    void Init() override
+    {
+        for (auto led : leds)
+        {
+            led->Light();
+        }
+        step = 0U;
+    }
+
+    void Work() override
+    {
+        // Переключаем светодиоды по очереди
+        if (step == Size)
+        {
+            step = 0;
+        }
+        leds[step]->Toggle();
+        ++step;
+    }
+
+private:
+    const std::array<ILed*, Size>& leds;
+    std::size_t step;
+};
+
+#endif // UNTITLED2_MODETREE_H
+----
+
+=== ModeChess — «шахматка»
+
+Это новый режим, который нужно было добавить самостоятельно.
+
+* `Init()` — сначала зажигает все светодиоды, а потом переключает нечётные (с номерами 1, 3, ...). В итоге горят только чётные (0, 2, ...).
+* `Work()` — переключает все светодиоды. Горели чётные — загорятся нечётные, и наоборот.
+
+Для выключения в `Init()` используется `Toggle()`, а не `PutOut()`, потому что `Reset()` у пина пока не реализован.
+
+[source,cpp]
+----
+#ifndef UNTITLED2_MODECHESS_H
+#define UNTITLED2_MODECHESS_H
+
+#include <array>
+#include <cstddef>
+
+#include "ILed.h"
+#include "IMode.h"
+
+// Режим "шахматка":
+//   Init  -> горят чётные светодиоды (0, 2, 4, ...), нечётные погашены;
+//   Work  -> все светодиоды инвертируются, т.е. теперь горят нечётные,
+//            следующий вызов — снова чётные и т.д.
+template <std::size_t Size>
+class ModeChess final : public IMode
+{
+public:
+    explicit ModeChess(const std::array<ILed*, Size>& leds)
+        : leds(leds)
+    {
+    }
+
+    void Init() override
+    {
+        // Зажигаем все светодиоды...
+        for (auto led : leds)
+        {
+            led->Light();
+        }
+
+        // ...и гасим нечётные, оставляя гореть только чётные.
+        // Используем Toggle (гасим уже горящий), чтобы не зависеть
+        // от начального состояния LED — интерфейс ILed в примерах
+        // гарантирует только Light() и Toggle().
+        for (std::size_t i = 1; i < Size; i += 2)
+        {
+            leds[i]->Toggle();
+        }
+    }
+
+    void Work() override
+    {
+        // Инвертируем все LED: чётные погаснут, нечётные загорятся
+        // (и наоборот при следующем вызове).
+        for (auto led : leds)
+        {
+            led->Toggle();
+        }
+    }
+
+private:
+    const std::array<ILed*, Size>& leds;
+};
+
+#endif // UNTITLED2_MODECHESS_H
+----
+
+== Главный файл main.cpp
+
+В `main.cpp` мы:
+
+. Настраиваем тактирование в `+__low_level_init+` (внутренний генератор HSI, 16 МГц).
+. Создаём три вывода `Pin` и три светодиода `Led`. Один светодиод на плате не работает, поэтому используем три.
+. Складываем светодиоды в массив `leds`.
+. Создаём три режима и складываем их в массив `modes`.
+. В бесконечном цикле запускаем текущий режим, а через некоторое время переключаемся на следующий.
+
+[source,cpp]
+----
+#include <array>
+#include "rccregisters.hpp" // for RCC
+#include "gpioaregisters.hpp" // for GPIOA
+#include "gpiocregisters.hpp" // for GPIOC
+#include "Pin.h" // for Pin
+#include "Led.h" // for Led
+#include "ModeBlink.h" // for ModeBlink
+#include "ModeTree.h" // for ModeTree
+#include "ModeChess.h" // for ModeChess
+
+std::uint32_t SystemCoreClock = 16000000U;
+extern "C" int __low_level_init(void)
+{
+  RCC::CR::HSION::On::Set();
+  while (RCC::CR::HSIRDY::NotReady::IsSet())
+  {
+  }
+
+  RCC::CFGR::SW::Hsi::Set();
+  while (!RCC::CFGR::SWS::Hsi::IsSet())
+  {
+  }
+
+  RCC::APB2ENR::SYSCFGEN::Enable::Set();
+  return 1;
+}
+
+void delay(int cycles)
+{
+  for (int i = 0; i < cycles; ++i)
+  {
+    asm volatile ("");
+  }
+}
+
+Pin<GPIOC::ODR,5> pin5;
+Pin<GPIOC::ODR,8> pin8;
+Pin<GPIOC::ODR,9> pin9;
+Pin<GPIOA::ODR,5> pin5a;
+Led led1(pin5a);
+Led led2(pin9);
+Led led3(pin8);
+constexpr std::uint32_t ledsCount = 3U;
+std::array<ILed*, ledsCount> leds = {&led1,&led2,&led3};
+ModeBlink <ledsCount> modeBlink(leds);
+ModeTree <ledsCount> modeTree(leds);
+ModeChess <ledsCount> modeChess(leds);
+constexpr std::uint32_t modesCount = 3U;
+std::array<IMode*, modesCount> modes = {&modeBlink, &modeTree, &modeChess};
+constexpr std::uint32_t DELAYS_PER_10S = 100U;
+
+int main(void)
+{
+  RCC::AHB1ENR::GPIOAEN::Enable::Set();
+  RCC::AHB1ENR::GPIOCEN::Enable::Set();
+
+  GPIOA::MODER::MODER5::Output::Set();
+  GPIOC::MODER::MODER5::Output::Set();
+  GPIOC::MODER::MODER8::Output::Set();
+  GPIOC::MODER::MODER9::Output::Set();
+  std::uint32_t modeNumber = 0;
+
+  while (1)
+  {
+    for (std::uint32_t i = 0; i < DELAYS_PER_10S / ledsCount; ++i){
+      modes[modeNumber] -> Work();
+      delay(1000000);
+    }
+    modeNumber = (modeNumber + 1) % modesCount;
+    modes[modeNumber] -> Init();
+  }
+}
+----
+
+=== Как работает главный цикл
+
+* Внутренний цикл `for` вызывает `Work()` текущего режима и делает паузу `delay(1000000)`. Так повторяется `DELAYS_PER_10S / ledsCount` раз, то есть 100 / 3 = 33 раза. Это занимает примерно 10 секунд.
+* Потом номер режима увеличивается: `modeNumber = (modeNumber + 1) % modesCount`. Остаток от деления на `modesCount` нужен, чтобы после последнего режима снова начался первый (0, 1, 2, 0, 1, 2, ...).
+* После смены режима вызывается `Init()` нового режима, чтобы светодиоды встали в его начальное состояние.
+
+== Добавление режима «шахматка»
+
+Чтобы добавить новый режим, не трогая логику программы, нужно было сделать только три вещи:
+
+. Написать класс `ModeChess` (файл `ModeChess.h`).
+. В `main.cpp` подключить файл и создать объект: `ModeChess <ledsCount> modeChess(leds);`
+. Увеличить `modesCount` до трёх и добавить `&modeChess` в массив `modes`.
+
+Главный цикл `while (1)` при этом остался без изменений. Так же можно легко добавить четвёртый светодиод: нужно изменить `ledsCount` и добавить его в массив `leds`.
+
+== Замечания
+
+* В `Pin::Reset()` код выключения пока закомментирован, поэтому `Led::PutOut()` сейчас ничего не делает. Режимы это обходят: они используют `Light()` и `Toggle()`.
+* Метод `Pin::GetState()` пока не реализован.
+* Время 10 секунд получается приблизительно, потому что пауза сделана пустым циклом `delay()`. Точнее время можно мерить таймером, но это уже следующая тема.
+
+== Вывод
+
+В этой работе мы сделали интерфейс режима `IMode` и три режима работы светодиодов: моргание, «ёлочку» и «шахматку». Светодиоды и режимы хранятся в массивах `std::array`, а режимы переключаются по кругу каждые примерно 10 секунд. Программа стала удобнее: чтобы добавить новый режим или светодиод, не нужно переписывать главный цикл, достаточно создать новый объект и добавить его в массив.
